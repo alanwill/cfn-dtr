@@ -1,0 +1,547 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "Builds Docker Trusted Registry w/ Docker 1.9 environment",
+
+  "Parameters" : {
+    "AppKeyName": {
+      "Description" : "Name of an existing EC2 KeyPair to enable SSH access to the Docker host instances",
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "ConstraintDescription": "must be the name of an existing EC2 KeyPair."
+    },
+    "InternalCorporateCidrIp" : {
+      "Description" : "Corporate internal CIDR (Used to limit ingress traffic only from the corporate IP space)",
+      "Type" : "String",
+      "Default" :  "10.0.0.0/8"
+    },
+    "AppName" : {
+      "Description" : "What is the name of the application? This is used to tag the resources",
+      "Type": "String",
+      "MinLength": "3",
+      "MaxLength": "25",
+      "ConstraintDescription": "must be a valid IP CIDR range of the form x.x.x.x/x."
+    },
+    "DTRInstanceType" : {
+      "Description" : "Instance type for Docker Trusted Registry node(s)",
+      "Type" : "String",
+      "Default" : "t2.micro",
+      "AllowedValues" : [ "t2.micro","t2.small","t2.medium","t2.large","m4.large","m4.xlarge","m4.2xlarge","m4.4xlarge" ]
+    },
+    "ELBLogsBucket" : {
+      "Description" : "Name of S3 bucket for sending ELB logs. NOTE: This bucket MUST be in the same region as ELB",
+      "Type": "String",
+      "MinLength": "3",
+      "MaxLength": "30",
+      "ConstraintDescription": "Must be a text input"
+    },
+    "DTRAMI" : {
+      "Description" : "Optional: AMI to be used for the DTR instance. Leave 'default' if not custom AMI is needed, for example with aufs drivers",
+      "Type" : "String",
+      "Default" : "default",
+      "MaxLength": "12"
+    },
+    "DTRStorageBucket" : {
+      "Description" : "Name of S3 bucket for storing Docker images. ",
+      "Type": "String",
+      "MinLength": "3",
+      "MaxLength": "30",
+      "ConstraintDescription": "Must be a text input"
+    },
+    "EnvironmentName" : {
+      "Description" : "What is the environment type, e.g. prd/stg/dev/tst/uat/poc.",
+      "Type": "String",
+      "MinLength": "3",
+      "MaxLength": "5",
+      "ConstraintDescription": "must me be up to 5 characters."
+    },
+    "ApplicationSubnetAZ1" : {
+      "Description" : "Subnet ID for the Application subnet in AZ1",
+      "Type" : "AWS::EC2::Subnet::Id",
+      "ConstraintDescription": "Must be a valid subnet ID of the VPC where you're building this application in the form of subnet-abcdefgh"
+    },
+    "ApplicationSubnetAZ2" : {
+      "Description" : "Subnet ID for the Application subnet in AZ2",
+      "Type" : "AWS::EC2::Subnet::Id",
+      "ConstraintDescription": "Must be a valid subnet ID of the VPC where you're building this application in the form of subnet-abcdefgh"
+    },
+    "InternalLBSubnetAZ1" : {
+      "Description" : "Subnet ID for the Internal Load Balancers subnet in AZ1",
+      "Type" : "AWS::EC2::Subnet::Id",
+      "ConstraintDescription": "Must be a valid subnet ID of the VPC where you're building this application in the form of subnet-abcdefgh"
+    },
+    "InternalLBSubnetAZ2" : {
+      "Description" : "Subnet ID for the Internal Load Balancers subnet in AZ2",
+      "Type" : "AWS::EC2::Subnet::Id",
+      "ConstraintDescription": "Must be a valid subnet ID of the VPC where you're building this application in the form of subnet-abcdefgh"
+    },
+    "VPCID" : {
+      "Description" : "VPC ID",
+      "Type" : "AWS::EC2::VPC::Id",
+      "ConstraintDescription": "Must be the VPC ID of the VPC where you're building this application in the form of vpc-abcdefgh"
+    },
+    "ELBLogsBucketPrefix" : {
+      "Description" : "Prefix for ELB logs stored in S3 (Can be left blank)",
+      "Type" : "String"
+    },
+    "ELBName" : {
+      "Description" : "Name of the ELB",
+      "Type" : "String",
+      "Default" : "docker-hub"
+    },
+    "DockerSNSNotificationsARN" : {
+      "Description" : "ARN for the Docker Notifications SNS topic",
+      "Type" : "String"
+    }
+
+  },
+
+  "Metadata" : {
+    "AWS::CloudFormation::Interface" : {
+    "ParameterGroups" : [
+      {
+        "Label" : { "default" : "Network Configuration" },
+        "Parameters" : [ "InternalCorporateCidrIp", "ApplicationSubnetAZ1", "ApplicationSubnetAZ2", "InternalLBSubnetAZ1", "InternalLBSubnetAZ2", "VPCID" ]
+      },
+      {
+        "Label" : { "default" : "DTR Configuration" },
+        "Parameters" : [ "AppKeyName", "AppName", "EnvironmentName", "DTRInstanceType", "DTRAMI", "DTRStorageBucket", "DockerSNSNotificationsARN", "ELBName", "ELBLogsBucket", "ELBLogsBucketPrefix" ]
+      }
+    ],
+    "ParameterLabels" : {
+      "VPCID" : { "default" : "Which VPC should this be deployed to?" }
+    }
+  }
+},
+
+
+  "Conditions" : {
+      "UseDefaultAMI" : {"Fn::Equals" : [{"Ref" : "DTRAMI"}, "default"] }
+  },
+
+  "Mappings" : {
+    "AWSInstanceType2Arch" : {
+      "t2.micro"   : { "Arch" : "HVM64" },
+      "t2.small"   : { "Arch" : "HVM64" },
+      "t2.medium"  : { "Arch" : "HVM64" },
+      "t2.large"  : { "Arch" : "HVM64" },
+      "m3.medium"  : { "Arch" : "HVM64" },
+      "m3.large"  : { "Arch" : "HVM64" },
+      "m3.xlarge"  : { "Arch" : "HVM64" },
+      "m3.2xlarge"  : { "Arch" : "HVM64" },
+      "m4.large"  : { "Arch" : "HVM64" },
+      "m4.xlarge"  : { "Arch" : "HVM64" },
+      "m4.2xlarge"  : { "Arch" : "HVM64" },
+      "m4.4xlarge"  : { "Arch" : "HVM64" },
+      "c3.large"  : { "Arch" : "HVM64" },
+      "c3.xlarge"  : { "Arch" : "HVM64" },
+      "c3.2xlarge"  : { "Arch" : "HVM64" },
+      "c3.4xlarge"  : { "Arch" : "HVM64" },
+      "c3.8xlarge"  : { "Arch" : "HVM64" },
+      "r3.large"  : { "Arch" : "HVM64" },
+      "r3.xlarge"  : { "Arch" : "HVM64" },
+      "r3.2xlarge"  : { "Arch" : "HVM64" },
+      "r3.4xlarge"  : { "Arch" : "HVM64" },
+      "r3.8xlarge"  : { "Arch" : "HVM64" },
+      "i2.xlarge"  : { "Arch" : "HVM64" },
+      "i2.2xlarge"  : { "Arch" : "HVM64" },
+      "i2.4xlarge"  : { "Arch" : "HVM64" },
+      "i2.8xlarge"  : { "Arch" : "HVM64" },
+      "hs1.8xlarge"  : { "Arch" : "HVM64" }
+    },
+    "DTRRegionArch2AMI" : {
+      "us-west-2"      : {"HVM64" : "ami-9abea4fb"},
+      "us-west-1"      : {"HVM64" : "ami-06116566"},
+      "us-east-1"      : {"HVM64" : "ami-fce3c696"}
+    },
+    "AWSRegionArch2AMI" : {
+      "us-west-2"      : {"HVM64" : "ami-9abea4fb"},
+      "us-west-1"      : {"HVM64" : "ami-06116566"},
+      "us-east-1"      : {"HVM64" : "ami-fce3c696"}
+    }
+  },
+
+  "Resources" : {
+
+    "DockerHubElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "AccessLoggingPolicy" : {
+          "Enabled" : true,
+          "EmitInterval" : 5,
+          "S3BucketName" : { "Ref" : "ELBLogsBucket" },
+          "S3BucketPrefix" : { "Ref" : "ELBLogsBucketPrefix" }
+        },
+        "ConnectionDrainingPolicy" : { "Enabled" : true, "Timeout" : 300 },
+        "CrossZone" : true,
+        "HealthCheck" : {
+          "HealthyThreshold" : "5",
+          "Interval" : "60",
+           "Target" : "TCP:443",
+           "Timeout" : "5",
+           "UnhealthyThreshold" : "5"
+        },
+        "LoadBalancerName" : { "Ref" : "ELBName" },
+        "Listeners" : [ {
+          "InstancePort" : "443",
+          "InstanceProtocol" : "TCP",
+          "LoadBalancerPort" : "443",
+          "Protocol" : "TCP"
+         } ],
+        "Scheme" : "internal",
+        "Subnets" : [{ "Ref" : "InternalLBSubnetAZ1" }, { "Ref" : "InternalLBSubnetAZ2" }],
+        "SecurityGroups" : [ { "Ref" : "DockerHubInternalLoadBalancerSG" } ],
+        "Tags" : [
+          {
+            "Key" : "purpose",
+            "Value" : "Docker Hub"
+          },
+          {
+            "Key" : "stack",
+            "Value" : { "Ref" : "EnvironmentName" }
+          },
+          {
+            "Key" : "app",
+            "Value" : { "Ref" : "AppName" }
+          },
+          {
+            "Key" : "Name",
+            "Value" : "docker-hub"
+          }
+        ]
+      }
+    },
+
+    "DTRNode1DiskUtilizationRoot": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "DTR Root Disk Utilization",
+        "MetricName": "DiskSpaceUtilization",
+        "Namespace": "System/Linux",
+        "Statistic": "Average",
+        "Period": "300",
+        "EvaluationPeriods": "3",
+        "Threshold": "80",
+        "AlarmActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "OKActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "InsufficientDataActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "Dimensions": [
+           {
+              "Name": "AutoScalingGroupName",
+              "Value": { "Ref": "DTRGroup" }
+           },
+           {
+              "Name": "MountPath",
+              "Value": "/"
+           },
+           {
+              "Name": "Filesystem",
+              "Value": "/dev/xvda1"
+           }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+      }
+    },
+    "DTRNode1MemoryUtilization": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "DTR Memory Utilization",
+        "MetricName": "MemoryUtilization",
+        "Namespace": "System/Linux",
+        "Statistic": "Average",
+        "Period": "300",
+        "EvaluationPeriods": "3",
+        "Threshold": "80",
+        "AlarmActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "OKActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "InsufficientDataActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "Dimensions": [
+           {
+              "Name": "AutoScalingGroupName",
+              "Value": { "Ref": "DTRGroup" }
+           }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+      }
+    },
+    "DTRNode1CPUUtilization": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "DTR CPU Utilization",
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Period": "300",
+        "EvaluationPeriods": "2",
+        "Threshold": "90",
+        "AlarmActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "OKActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "InsufficientDataActions": [ { "Ref": "DockerSNSNotificationsARN" } ],
+        "Dimensions": [
+           {
+              "Name": "AutoScalingGroupName",
+              "Value": { "Ref": "DTRGroup" }
+           }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+      }
+    },
+
+   "DTRGroup" : {
+     "Type" : "AWS::AutoScaling::AutoScalingGroup",
+     "Properties" : {
+        "VPCZoneIdentifier" : [ { "Ref" : "ApplicationSubnetAZ1"}, {"Ref" : "ApplicationSubnetAZ2"}],
+        "Cooldown" : "300",
+        "LaunchConfigurationName" : { "Ref" : "DTRLaunchConfig" },
+        "DesiredCapacity" : "1",
+        "HealthCheckGracePeriod" : 900,
+        "HealthCheckType" : "ELB",
+        "MinSize" : "1",
+        "MaxSize" : "1",
+        "LoadBalancerNames" : [ { "Ref" : "DockerHubElasticLoadBalancer" } ],
+        "NotificationConfigurations" : [
+          {
+            "TopicARN" : { "Ref" : "DockerSNSNotificationsARN" },
+            "NotificationTypes" : [
+              "autoscaling:EC2_INSTANCE_LAUNCH",
+              "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+              "autoscaling:EC2_INSTANCE_TERMINATE",
+              "autoscaling:EC2_INSTANCE_TERMINATE_ERROR"
+            ]
+          }
+        ],
+        "MetricsCollection": [
+           {
+              "Granularity": "1Minute",
+              "Metrics": [
+                 "GroupMinSize",
+                 "GroupMaxSize"
+              ]
+           }
+        ],
+        "Tags" : [ {
+           "Key" : "Name",
+           "Value" : "DTR Node",
+           "PropagateAtLaunch" : "true"
+           },
+           {
+            "Key" : "stack",
+            "Value" : { "Ref" : "EnvironmentName" },
+            "PropagateAtLaunch" : "true"
+           },
+           {
+            "Key" : "app",
+            "Value" : { "Ref" : "AppName" },
+            "PropagateAtLaunch" : "true"
+           },
+           {
+           "Key" : "purpose",
+           "Value" : "Docker Trusted Registry",
+           "PropagateAtLaunch" : "true"
+          }
+        ]
+     }
+   },
+
+
+   "DTRLaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Properties" : {
+         "KeyName" : { "Ref" : "AppKeyName" },
+         "ImageId" : {
+            "Fn::If" : [
+              "UseDefaultAMI",
+              { "Fn::FindInMap" : [ "DTRRegionArch2AMI", { "Ref" : "AWS::Region" },
+                                          { "Fn::FindInMap" : [ "AWSInstanceType2Arch", { "Ref" : "DTRInstanceType" },
+                                          "Arch" ] } ] },
+              {"Ref" : "DTRAMI"}
+            ]},
+         "SecurityGroups" : [ { "Ref" : "DockerHubNodesSG" } ],
+         "InstanceType" : { "Ref" : "DTRInstanceType" },
+         "IamInstanceProfile": { "Ref": "DTRInstanceProfile" },
+         "BlockDeviceMappings" : [
+          {
+            "DeviceName" : "/dev/sda1",
+            "Ebs" : { "VolumeSize" : "20", "VolumeType":"gp2" }
+          }
+        ],
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+             "#!/bin/bash \n",
+             "apt-get update -y\n",
+             "curl -O https://bootstrap.pypa.io/get-pip.py\n",
+             "python get-pip.py\n",
+             "rm -f get-pip.py\n",
+             "pip install awscli\n",
+             "\n",
+             "echo \"deb https://packages.docker.com/1.9/apt/repo ubuntu-trusty main\" | tee /etc/apt/sources.list.d/docker.list\n",
+             "curl -s 'https://sks-keyservers.net/pks/lookup?op=get&search=0xee6d536cf7dc86e2d7d56f59a178ac6c6238f52e' | apt-key add --import\n",
+             "apt-get update -y\n",
+             "apt-get install docker-engine -y\n",
+             "service docker start\n",
+             "usermod -aG docker ubuntu\n",
+             "aws s3 cp s3://", { "Ref" : "DTRStorageBucket" }, "/install/var-local-dtr.tar.gz .\n",
+             "aws s3 cp s3://", { "Ref" : "DTRStorageBucket" }, "/install/usr-local-etc-dtr.tar.gz .\n",
+             "mkdir -p /var/local/dtr && mv var-local-dtr.tar.gz /var/local/dtr\n",
+             "mkdir -p /usr/local/etc/dtr && mv usr-local-etc-dtr.tar.gz /usr/local/etc/dtr\n",
+             "tar xvf /var/local/dtr/var-local-dtr.tar.gz -C /var/local/dtr/\n",
+             "tar xvf /usr/local/etc/dtr/usr-local-etc-dtr.tar.gz -C /usr/local/etc/dtr/\n",
+             "rm -f /var/local/dtr/var-local-dtr.tar.gz && rm -f /usr/local/etc/dtr/usr-local-etc-dtr.tar.gz\n",
+             "bash -c \"$(sudo docker run docker/trusted-registry install)\"\n",
+             "\n",
+             "# Security Updates START #\n",
+             "apt-get install unattended-upgrades -y\n",
+             "echo -e \"APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\" > /etc/apt/apt.conf.d/20auto-upgrades\n",
+             "# Security Updates END #\n",
+             "\n",
+             "# Temp code START #\n",
+             "export DTRS3BUCKET=", { "Ref" : "DTRStorageBucket" }, "\n",
+             "aws s3 cp s3://", { "Ref" : "DTRStorageBucket" }, "/install/dtr-pg-restore.sh /root\n",
+             "chmod 755 /root/dtr-pg-restore.sh\n",
+             "sh /root/dtr-pg-restore.sh\n",
+             "rm -f /root/dtr-pg-restore.sh\n",
+             "aws s3 cp s3://", { "Ref" : "DTRStorageBucket" }, "/install/dtr-pg-backup.sh /root\n",
+             "chmod 755 /root/dtr-pg-backup.sh\n",
+             "sh /root/dtr-pg-backup.sh\n",
+             "rm -f /root/dtr-pg-backup.sh\n",
+             "# Temp code END #\n",
+             "# Monitoring code START #\n",
+             "aws s3 cp s3://", { "Ref" : "DTRStorageBucket" }, "/install/monitoring.sh /root\n",
+             "chmod 755 /root/monitoring.sh\n",
+             "sh /root/monitoring.sh\n",
+             "rm -f /root/monitoring.sh\n",
+             "# Monitoring code END #\n"
+          ]]}}
+      }
+   },
+
+    "ReadWriteToDTRBucket" : {
+      "Type" : "AWS::IAM::ManagedPolicy",
+      "Properties" : {
+        "Description" : "Read/Write access to DTR config and image bucket",
+        "Path" : "/",
+        "PolicyDocument" :   {
+          "Version":"2012-10-17",
+          "Statement": [
+              {
+                  "Effect": "Allow",
+                  "Action": ["s3:ListBucket" ],
+                  "Resource": {"Fn::Join" : [ "", [ "arn:aws:s3:", ":", ":", { "Ref" : "DTRStorageBucket" }] ]}
+              },
+              {
+                  "Effect": "Allow",
+                  "Action": [ "s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+                  "Resource": {"Fn::Join" : [ "", [ "arn:aws:s3:", ":", ":", { "Ref" : "DTRStorageBucket" }, "/*" ] ]}
+              }
+          ]
+        }
+      }
+    },
+
+    "MonitoringDTR" : {
+      "Type" : "AWS::IAM::ManagedPolicy",
+      "Properties" : {
+        "Description" : "Cloudwatch monitoring for DTR custom metrics",
+        "Path" : "/",
+        "PolicyDocument" :   {
+          "Version":"2012-10-17",
+          "Statement": [
+              {
+                  "Effect": "Allow",
+                  "Action": [ "cloudwatch:PutMetricData",
+                                "cloudwatch:GetMetricStatistics",
+                                "cloudwatch:ListMetrics",
+                                "ec2:DescribeTags"
+                            ],
+                  "Resource": [ "*" ]
+              }
+          ]
+        }
+      }
+    },
+
+    "DTRInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Path": "/",
+        "Roles": [
+          {
+            "Ref": "DTRRole"
+          }
+        ]
+      }
+    },
+
+    "DTRRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": [ "ec2.amazonaws.com" ] },
+              "Action": [ "sts:AssumeRole" ]
+            }
+          ]
+        },
+        "Path": "/",
+        "ManagedPolicyArns" : [{ "Ref" : "ReadWriteToDTRBucket" }, { "Ref" : "MonitoringDTR" }]
+      }
+    },
+
+
+    "DockerHubNodesSG" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Docker Hub Nodes",
+        "VpcId" : {"Ref" : "VPCID"},
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "SourceSecurityGroupId" : { "Ref" : "DockerHubInternalLoadBalancerSG" } }
+        ],
+        "Tags" : [
+          {
+            "Key" : "purpose",
+            "Value" : "Docker Hub Nodes"
+          },
+          {
+            "Key" : "stack",
+            "Value" : { "Ref" : "EnvironmentName" }
+          },
+          {
+            "Key" : "app",
+            "Value" : { "Ref" : "AppName" }
+          }
+        ]
+      }
+    },
+
+    "DockerHubInternalLoadBalancerSG" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Docker Hub Elastic Load Balancer",
+        "VpcId" : {"Ref" : "VPCID"},
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : { "Ref" : "InternalCorporateCidrIp" } }
+        ],
+        "Tags" : [
+          {
+            "Key" : "purpose",
+            "Value" : "Docker Hub Internal Load Balancer"
+          },
+          {
+            "Key" : "stack",
+            "Value" : { "Ref" : "EnvironmentName" }
+          },
+          {
+            "Key" : "app",
+            "Value" : { "Ref" : "AppName" }
+          }
+        ]
+      }
+    }
+  },
+
+  "Outputs" : {
+
+  }
+
+
+}
